@@ -5,6 +5,7 @@
  * 支持多账号切换，基于WebSocket API获取数据
  */
 import { useEffect, useState, useRef, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Loader2, LogIn, LogOut, MessageCircle, RefreshCw, User, ChevronUp, X, Send, AlertCircle, Ban, ImagePlus } from 'lucide-react'
 import { useUIStore } from '@/store/uiStore'
 import {
@@ -52,6 +53,7 @@ const canRecallMessage = (message: ChatMessage) =>
   Date.now() - toTimestampMs(message.time) <= 120_000
 
 export function ChatNew() {
+  const navigate = useNavigate()
   const { addToast } = useUIStore()
 
   // 账号相关（分页加载）
@@ -117,6 +119,33 @@ export function ChatNew() {
 
   // 手动管理 WebSocket 连接的账号列表（仅用户显式操作时加入，页面刷新不自动重连）
   const [wsAccountIds, setWsAccountIds] = useState<string[]>([])
+  // 账号级新消息通知（用于账号列表提示哪个账号收到新消息）
+  const [accountUnreadCounts, setAccountUnreadCounts] = useState<Record<string, number>>({})
+
+  const clearAccountUnread = useCallback((accountId: string) => {
+    setAccountUnreadCounts((prev) => {
+      if (!prev[accountId]) return prev
+      const next = { ...prev }
+      delete next[accountId]
+      return next
+    })
+  }, [])
+
+  const decreaseAccountUnread = useCallback((accountId: string, count: number) => {
+    if (count <= 0) return
+    setAccountUnreadCounts((prev) => {
+      const current = prev[accountId] || 0
+      if (current <= 0) return prev
+      const nextCount = Math.max(0, current - count)
+      const next = { ...prev }
+      if (nextCount > 0) {
+        next[accountId] = nextCount
+      } else {
+        delete next[accountId]
+      }
+      return next
+    })
+  }, [])
 
   // 手机端 Tab 切换（桌面端 md+ 仍为四栏并排，本 state 不影响桌面布局）
   type MobileTab = 'accounts' | 'convs' | 'chat' | 'tools'
@@ -162,6 +191,59 @@ export function ChatNew() {
   }>>>({})
   /** 记住每个账号上次选中的会话 */
   const activeConvPerAccountRef = useRef<Record<string, string>>({})
+  // 用 ref 保持 accounts 最新引用，供系统通知回调读取账号名称
+  const accountsRef = useRef(accounts)
+  useEffect(() => { accountsRef.current = accounts }, [accounts])
+
+  // 浏览器系统通知：权限只能在用户手势中稳定触发，因此连接/选择账号时请求
+  const shownSystemNotificationKeysRef = useRef<Set<string>>(new Set())
+  const ensureSystemNotificationPermission = useCallback(() => {
+    if (!('Notification' in window)) return
+    if (Notification.permission === 'default') {
+      void Notification.requestPermission().catch(() => {})
+    }
+  }, [])
+
+  const showSystemNotification = useCallback((accountId: string, cid: string, msg: ChatMessage) => {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return
+
+    const messageKey = msg.messageId || `${accountId}:${cid}:${msg.time}:${msg.text}`
+    if (messageKey) {
+      const shownKeys = shownSystemNotificationKeysRef.current
+      if (shownKeys.has(messageKey)) return
+      if (shownKeys.size > 200) shownKeys.clear()
+      shownKeys.add(messageKey)
+    }
+
+    const account = accountsRef.current.find((item) => item.account_id === accountId)
+    const accountName = account?.display_name || account?.remark || accountId
+    const senderName = msg.senderName && !isPureDigits(msg.senderName) ? msg.senderName : '新消息'
+    const preview = msg.type === 'image'
+      ? '[图片]'
+      : msg.type === 'card'
+        ? '[卡片消息]'
+        : (msg.text || '收到一条新消息')
+
+    try {
+      const notification = new Notification(`闲鱼新消息 - ${accountName}`, {
+        body: `${senderName}：${preview}`.slice(0, 120),
+        icon: '/favicon.svg',
+        tag: `chat-new:${accountId}:${cid}`,
+      })
+      notification.onclick = () => {
+        window.focus()
+        navigate('/online-chat-new')
+        activeConvPerAccountRef.current[accountId] = cid
+        setActiveAccountId(accountId)
+        setActiveCid(cid)
+        setWsAccountIds((prev) => prev.includes(accountId) ? prev : [...prev, accountId])
+        setMobileTab('chat')
+        notification.close()
+      }
+    } catch {
+      // 系统通知不可用时忽略，不影响页面内未读提示
+    }
+  }, [navigate])
 
   /**
    * 同步当前会话列表到缓存
@@ -208,7 +290,12 @@ export function ChatNew() {
     if (exists) {
       const updated = convs.map((c) => {
         if (c.cid !== cid) return c
-        return { ...c, lastMessageSummary: summary, lastMessageTime: msg.time, unreadCount: isViewing ? 0 : c.unreadCount + 1 }
+        return {
+          ...c,
+          lastMessageSummary: summary,
+          lastMessageTime: msg.time,
+          unreadCount: isViewing ? 0 : (msg.isSelf ? c.unreadCount : c.unreadCount + 1),
+        }
       })
       const target = updated.find((c) => c.cid === cid)!
       return [target, ...updated.filter((c) => c.cid !== cid)]
@@ -220,7 +307,7 @@ export function ChatNew() {
       otherUserName: msg.isSelf ? '' : (msg.senderName || ''),
       otherUserAvatar: '', itemTitle: '',
       lastMessageSummary: summary, lastMessageTime: msg.time,
-      unreadCount: isViewing ? 0 : 1,
+      unreadCount: isViewing || msg.isSelf ? 0 : 1,
     }
     return [newConv, ...convs]
   }
@@ -236,10 +323,18 @@ export function ChatNew() {
   const handleWsNewMessage = useCallback((accountId: string, cid: string, msg: ChatMessage) => {
     const summary = msg.type === 'image' ? '[图片]' : (msg.text || '').slice(0, 50)
     const isActiveAccount = accountId === activeAccountIdRef.current
+    const isViewingConv = isActiveAccount && cid === activeCidRef.current
+
+    if (!msg.isSelf && !isViewingConv) {
+      setAccountUnreadCounts((prev) => ({
+        ...prev,
+        [accountId]: (prev[accountId] || 0) + 1,
+      }))
+      showSystemNotification(accountId, cid, msg)
+    }
 
     if (isActiveAccount) {
       // 活跃账号 → 直接更新 React state
-      const isViewingConv = cid === activeCidRef.current
       setConversations((prev) => updateConvList(prev, cid, summary, msg, isViewingConv))
       if (isViewingConv) {
         setMessages((prev) => appendMsg(prev, msg))
@@ -257,7 +352,7 @@ export function ChatNew() {
         msgCache.msgs = appendMsg(msgCache.msgs, msg)
       }
     }
-  }, [])
+  }, [showSystemNotification])
 
   // WebSocket 断连时刷新账号状态（节流：最多每 5 秒刷一次）
   const lastDisconnectRefreshRef = useRef(0)
@@ -311,6 +406,7 @@ export function ChatNew() {
 
   // ==================== 连接/断开 ====================
   const handleConnect = async (accountId: string) => {
+    ensureSystemNotificationPermission()
     setConnectingId(accountId)
     try {
       const res = await connectAccount(accountId)
@@ -344,6 +440,7 @@ export function ChatNew() {
         // 手机端：当前账号被断开后回到"账号"Tab
         setMobileTab('accounts')
       }
+      clearAccountUnread(accountId)
       await loadAccounts()
     } catch (e: any) {
       addToast({ message: e.message || '断开失败', type: 'error' })
@@ -353,6 +450,7 @@ export function ChatNew() {
   /** 点击账号卡片：已连接则选中，未连接则自动连接 */
   const handleSelectAccount = async (acc: ChatAccount) => {
     if (acc.connected) {
+      ensureSystemNotificationPermission()
       setActiveAccountId(acc.account_id)
       // 选中已连接账号时也建立 WebSocket（页面刷新后首次选中时触发）
       setWsAccountIds((prev) => prev.includes(acc.account_id) ? prev : [...prev, acc.account_id])
@@ -406,10 +504,6 @@ export function ChatNew() {
     },
     [addToast, convCursor],
   )
-
-  // 用 ref 保持 accounts 最新引用，避免 effect 闭包取到旧值
-  const accountsRef = useRef(accounts)
-  useEffect(() => { accountsRef.current = accounts }, [accounts])
 
   // 选中账号时：优先从缓存恢复，无缓存才加载
   useEffect(() => {
@@ -568,6 +662,8 @@ export function ChatNew() {
 
   // 选中会话时：优先从缓存恢复消息，无缓存才加载
   const handleSelectConversation = (cid: string) => {
+    const unreadCount = conversations.find((c) => c.cid === cid)?.unreadCount || 0
+    decreaseAccountUnread(activeAccountId, unreadCount)
     setActiveCid(cid)
     // 手机端：选中会话后切到"聊天"Tab
     setMobileTab('chat')
@@ -1052,8 +1148,9 @@ export function ChatNew() {
   // ==================== 渲染 ====================
   // 手机端各 Tab 对应未读 / 状态提示
   const totalUnread = conversations.reduce((sum, c) => sum + (c.unreadCount || 0), 0)
+  const totalAccountUnread = Object.values(accountUnreadCounts).reduce((sum, count) => sum + count, 0)
   const tabItems: Array<{ key: MobileTab; label: string; badge?: number; disabled?: boolean }> = [
-    { key: 'accounts', label: '账号' },
+    { key: 'accounts', label: '账号', badge: totalAccountUnread },
     { key: 'convs', label: '会话', badge: totalUnread, disabled: !activeAccountId },
     { key: 'chat', label: '聊天', disabled: !activeCid },
     { key: 'tools', label: '工作区', disabled: !activeCid },
@@ -1119,71 +1216,84 @@ export function ChatNew() {
             <p className="text-center text-sm text-gray-400 py-8">暂无可用账号</p>
           ) : (
             <>
-              {accounts.map((acc) => (
-                <div
-                  key={acc.account_id}
-                  className={`p-2 rounded-lg transition-colors text-sm cursor-pointer ${
-                    activeAccountId === acc.account_id
-                      ? 'bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700'
-                      : 'hover:bg-gray-50 dark:hover:bg-gray-700/50 border border-transparent'
-                  }`}
-                  onClick={() => handleSelectAccount(acc)}
-                  title={`${acc.display_name || acc.remark || acc.account_id}\n(${acc.account_id})`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2 min-w-0 flex-1">
-                      <User className="w-4 h-4 flex-shrink-0 text-gray-400" />
-                      <div className="min-w-0 flex-1">
-                        <span className="block truncate text-gray-700 dark:text-gray-300">
-                          {acc.display_name || acc.remark || acc.account_id}
-                        </span>
-                        {(acc.display_name || acc.remark) && (
-                          <span className="block truncate text-xs text-gray-400 dark:text-gray-500">
-                            {acc.remark && acc.remark !== acc.display_name ? acc.remark : acc.account_id}
+              {accounts.map((acc) => {
+                const accountUnread = accountUnreadCounts[acc.account_id] || 0
+                return (
+                  <div
+                    key={acc.account_id}
+                    className={`p-2 rounded-lg transition-colors text-sm cursor-pointer ${
+                      activeAccountId === acc.account_id
+                        ? 'bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700'
+                        : 'hover:bg-gray-50 dark:hover:bg-gray-700/50 border border-transparent'
+                    }`}
+                    onClick={() => handleSelectAccount(acc)}
+                    title={`${acc.display_name || acc.remark || acc.account_id}\n(${acc.account_id})`}
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                        <User className="w-4 h-4 flex-shrink-0 text-gray-400" />
+                        <div className="min-w-0 flex-1">
+                          <span className="block truncate text-gray-700 dark:text-gray-300">
+                            {acc.display_name || acc.remark || acc.account_id}
+                          </span>
+                          {(acc.display_name || acc.remark) && (
+                            <span className="block truncate text-xs text-gray-400 dark:text-gray-500">
+                              {acc.remark && acc.remark !== acc.display_name ? acc.remark : acc.account_id}
+                            </span>
+                          )}
+                          {acc.owner && (
+                            <span className="block truncate text-xs text-blue-400 dark:text-blue-500">
+                              {acc.owner}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex flex-shrink-0 items-center gap-1">
+                        {accountUnread > 0 && (
+                          <span
+                            className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-red-500 px-1.5 text-[10px] font-medium leading-none text-white"
+                            title={`${accountUnread} 条新消息`}
+                          >
+                            {accountUnread > 99 ? '99+' : accountUnread}
                           </span>
                         )}
-                        {acc.owner && (
-                          <span className="block truncate text-xs text-blue-400 dark:text-blue-500">
-                            {acc.owner}
-                          </span>
+                        {acc.connected ? (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleDisconnect(acc.account_id) }}
+                            className="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded"
+                            title="断开"
+                          >
+                            <LogOut className="w-3.5 h-3.5" />
+                          </button>
+                        ) : (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleConnect(acc.account_id) }}
+                            disabled={!!connectingId}
+                            className="p-1 text-green-500 hover:text-green-700 hover:bg-green-50 dark:hover:bg-green-900/30 rounded disabled:opacity-50"
+                            title="连接"
+                          >
+                            {connectingId === acc.account_id ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <LogIn className="w-3.5 h-3.5" />
+                            )}
+                          </button>
                         )}
                       </div>
                     </div>
-                    {acc.connected ? (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); handleDisconnect(acc.account_id) }}
-                        className="p-1 text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded"
-                        title="断开"
-                      >
-                        <LogOut className="w-3.5 h-3.5" />
-                      </button>
-                    ) : (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); handleConnect(acc.account_id) }}
-                        disabled={!!connectingId}
-                        className="p-1 text-green-500 hover:text-green-700 hover:bg-green-50 dark:hover:bg-green-900/30 rounded disabled:opacity-50"
-                        title="连接"
-                      >
-                        {connectingId === acc.account_id ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : (
-                          <LogIn className="w-3.5 h-3.5" />
-                        )}
-                      </button>
-                    )}
+                    <div className="mt-1 flex items-center gap-1">
+                      <span
+                        className={`inline-block w-1.5 h-1.5 rounded-full ${
+                          acc.connected ? 'bg-green-500' : acc.status !== 'active' ? 'bg-orange-400' : 'bg-gray-300'
+                        }`}
+                      />
+                      <span className="text-xs text-gray-400">
+                        {acc.connected ? '已连接' : acc.status !== 'active' ? '已禁用' : '未连接'}
+                      </span>
+                    </div>
                   </div>
-                  <div className="mt-1 flex items-center gap-1">
-                    <span
-                      className={`inline-block w-1.5 h-1.5 rounded-full ${
-                        acc.connected ? 'bg-green-500' : acc.status !== 'active' ? 'bg-orange-400' : 'bg-gray-300'
-                      }`}
-                    />
-                    <span className="text-xs text-gray-400">
-                      {acc.connected ? '已连接' : acc.status !== 'active' ? '已禁用' : '未连接'}
-                    </span>
-                  </div>
-                </div>
-              ))}
+                )
+              })}
               {accountHasMore && (
                 <button
                   onClick={loadMoreAccounts}
